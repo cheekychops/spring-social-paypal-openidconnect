@@ -15,8 +15,8 @@ limitations under the License.
 
 **/
 
-Spring Social PayPal using OpenIdConnect
-==============================================
+Spring Social PayPal using OpenIdConnect on Google App Engine
+=============================================================
 
 Spring Social PayPal is a Spring Social extension that provides support for the 'Login with PayPal' API. Login With PayPal conforms to OpenId Connect specification(http://openid.net/connect/).
 

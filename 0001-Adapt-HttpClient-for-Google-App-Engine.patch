@@ -1,0 +1,565 @@
+From 51d0003e5219f3d8e7577c3895aa3e358c46114f Mon Sep 17 00:00:00 2001
+From: Colin <smithcolina@hotmail.com>
+Date: Sun, 15 Mar 2015 23:25:53 +0000
+Subject: [PATCH 1/1] Adapt HttpClient for Google App Engine
+
+---
+ .../social/openidconnect/HttpClientFactory.java    |  21 +--
+ .../api/impl/AbstractOAuth2ApiBinding.java         | 204 +++++++++++++++++++++
+ ...CompatibleClientHttpRequestFactorySelector.java |  96 ++++++++++
+ .../api/impl/OAuth2RequestInterceptor.java         |  50 +++++
+ .../OAuth2TokenParameterRequestInterceptor.java    |  61 ++++++
+ .../openidconnect/api/impl/TokenStrategy.java      |  54 ++++++
+ 6 files changed, 469 insertions(+), 17 deletions(-)
+ create mode 100644 src/main/java/org/springframework/social/openidconnect/api/impl/AbstractOAuth2ApiBinding.java
+ create mode 100644 src/main/java/org/springframework/social/openidconnect/api/impl/GAECompatibleClientHttpRequestFactorySelector.java
+ create mode 100644 src/main/java/org/springframework/social/openidconnect/api/impl/OAuth2RequestInterceptor.java
+ create mode 100644 src/main/java/org/springframework/social/openidconnect/api/impl/OAuth2TokenParameterRequestInterceptor.java
+ create mode 100644 src/main/java/org/springframework/social/openidconnect/api/impl/TokenStrategy.java
+
+diff --git a/src/main/java/org/springframework/social/openidconnect/HttpClientFactory.java b/src/main/java/org/springframework/social/openidconnect/HttpClientFactory.java
+index 18ab88a..7637a4d 100644
+--- a/src/main/java/org/springframework/social/openidconnect/HttpClientFactory.java
++++ b/src/main/java/org/springframework/social/openidconnect/HttpClientFactory.java
+@@ -1,5 +1,7 @@
+ package org.springframework.social.openidconnect;
+ 
++import javax.net.ssl.SSLContext;
++
+ import org.apache.http.client.HttpClient;
+ import org.apache.http.conn.ClientConnectionManager;
+ import org.apache.http.conn.scheme.PlainSocketFactory;
+@@ -10,21 +12,7 @@ import org.apache.http.conn.ssl.X509HostnameVerifier;
+ import org.apache.http.impl.client.DefaultHttpClient;
+ import org.apache.http.impl.conn.PoolingClientConnectionManager;
+ import org.apache.log4j.Logger;
+-import org.springframework.http.client.ClientHttpRequestFactory;
+ import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
+-import org.springframework.http.converter.FormHttpMessageConverter;
+-import org.springframework.http.converter.HttpMessageConverter;
+-import org.springframework.http.converter.json.MappingJacksonHttpMessageConverter;
+-import org.springframework.social.ApiException;
+-import org.springframework.social.InternalServerErrorException;
+-import org.springframework.social.ServerException;
+-import org.springframework.social.support.ClientHttpRequestFactorySelector;
+-import org.springframework.web.client.DefaultResponseErrorHandler;
+-import org.springframework.web.client.RestTemplate;
+-
+-import javax.net.ssl.SSLContext;
+-import java.util.ArrayList;
+-import java.util.List;
+ 
+ /**
+  * Factory which gives more fine grained control over creation of <code>RestTemplate</code> and allows configuration such as connection time out,
+@@ -50,11 +38,10 @@ public final class HttpClientFactory {
+      * @return - {@link HttpComponentsClientHttpRequestFactory}
+      */
+     public static HttpComponentsClientHttpRequestFactory getRequestFactory(boolean isStrict){
+-        HttpComponentsClientHttpRequestFactory factory = new HttpComponentsClientHttpRequestFactory();
++        HttpClient httpClient = new DefaultHttpClient(getPooledConnectionManager(isStrict));
++        HttpComponentsClientHttpRequestFactory factory = new HttpComponentsClientHttpRequestFactory(httpClient);
+         factory.setConnectTimeout(5000);
+         factory.setReadTimeout(5000);
+-        HttpClient httpClient = new DefaultHttpClient(getPooledConnectionManager(isStrict));
+-        factory.setHttpClient(httpClient);
+         if(logger.isDebugEnabled()){
+             logger.debug("Factory is set to use connection time out and read time out");
+         }
+diff --git a/src/main/java/org/springframework/social/openidconnect/api/impl/AbstractOAuth2ApiBinding.java b/src/main/java/org/springframework/social/openidconnect/api/impl/AbstractOAuth2ApiBinding.java
+new file mode 100644
+index 0000000..8b0fbef
+--- /dev/null
++++ b/src/main/java/org/springframework/social/openidconnect/api/impl/AbstractOAuth2ApiBinding.java
+@@ -0,0 +1,204 @@
++/*
++ * Copyright 2014 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.springframework.social.openidconnect.api.impl;
++
++import java.nio.charset.Charset;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.LinkedList;
++import java.util.List;
++
++import org.springframework.http.MediaType;
++import org.springframework.http.client.ClientHttpRequestFactory;
++import org.springframework.http.client.ClientHttpRequestInterceptor;
++import org.springframework.http.converter.ByteArrayHttpMessageConverter;
++import org.springframework.http.converter.FormHttpMessageConverter;
++import org.springframework.http.converter.HttpMessageConverter;
++import org.springframework.http.converter.ResourceHttpMessageConverter;
++import org.springframework.http.converter.StringHttpMessageConverter;
++import org.springframework.http.converter.json.MappingJackson2HttpMessageConverter;
++import org.springframework.social.ApiBinding;
++import org.springframework.social.oauth2.OAuth2Version;
++import org.springframework.web.client.RestTemplate;
++
++/**
++ * Base class for OAuth 2-based provider API bindings.
++ * @author Craig Walls
++ */
++public abstract class AbstractOAuth2ApiBinding implements ApiBinding {
++
++	private final String accessToken;
++
++	private final RestTemplate restTemplate;
++
++	/**
++	 * Constructs the API template without user authorization. This is useful for accessing operations on a provider's API that do not require user authorization.
++	 */
++	protected AbstractOAuth2ApiBinding() {
++		accessToken = null;
++		restTemplate = createRestTemplateWithCulledMessageConverters();
++		configureRestTemplate(restTemplate);
++	}
++
++	/**
++	 * Constructs the API template with OAuth credentials necessary to perform operations on behalf of a user.
++	 * @param accessToken the access token
++	 */
++	protected AbstractOAuth2ApiBinding(String accessToken) {
++		this(accessToken, TokenStrategy.AUTHORIZATION_HEADER);
++	}
++
++	/**
++	 * Constructs the API template with OAuth credentials necessary to perform operations on behalf of a user.
++	 * @param accessToken the access token
++	 * @param tokenStrategy Specifies how access tokens are sent on API requests. Defaults to sending them in Authorization header.
++	 */
++	protected AbstractOAuth2ApiBinding(String accessToken, TokenStrategy tokenStrategy) {
++		this.accessToken = accessToken;
++		restTemplate = createRestTemplate(accessToken, getOAuth2Version(), tokenStrategy);
++		configureRestTemplate(restTemplate);
++	}
++
++	/**
++	 * Set the ClientHttpRequestFactory. This is useful when custom configuration of the request factory is required, such as configuring custom SSL details.
++	 * @param requestFactory the request factory
++	 */
++	public void setRequestFactory(ClientHttpRequestFactory requestFactory) {
++		restTemplate.setRequestFactory(requestFactory);
++	}
++
++	// implementing ApiBinding
++
++	@Override
++	public boolean isAuthorized() {
++		return accessToken != null;
++	}
++
++	// public implementation operations
++
++	/**
++	 * Obtains a reference to the REST client backing this API binding and used to perform API calls.
++	 * Callers may use the RestTemplate to invoke other API operations not yet modeled by the binding interface.
++	 * Callers may also modify the configuration of the RestTemplate to support unit testing the API binding with a mock server in a test environment.
++	 * During construction, subclasses may apply customizations to the RestTemplate needed to invoke a specific API.
++	 * @see RestTemplate#setMessageConverters(java.util.List)
++	 * @see RestTemplate#setErrorHandler(org.springframework.web.client.ResponseErrorHandler)
++	 */
++	public RestTemplate getRestTemplate() {
++		return restTemplate;
++	}
++
++	// subclassing hooks
++
++	/**
++	 * Returns the version of OAuth2 the API implements.
++	 * By default, returns {@link OAuth2Version#BEARER} indicating versions of OAuth2 that apply the bearer token scheme.
++	 * Subclasses may override to return another version.
++	 * @see OAuth2Version
++	 */
++	protected OAuth2Version getOAuth2Version() {
++		return OAuth2Version.BEARER;
++	}
++
++	/**
++	 * Subclassing hook to enable customization of the RestTemplate used to consume provider API resources.
++	 * An example use case might be to configure a custom error handler.
++	 * Note that this method is called after the RestTemplate has been configured with the message converters returned from getMessageConverters().
++	 * @param restTemplate the RestTemplate to configure.
++	 */
++	protected void configureRestTemplate(RestTemplate restTemplate) {
++	}
++
++	/**
++	 * Returns a list of {@link HttpMessageConverter}s to be used by the internal {@link RestTemplate}.
++	 * By default, this includes a {@link StringHttpMessageConverter}, a {@link MappingJackson2HttpMessageConverter}, a {@link ByteArrayHttpMessageConverter}, and a {@link FormHttpMessageConverter}.
++	 * The {@link FormHttpMessageConverter} is set to use "UTF-8" character encoding.
++	 * Override this method to add additional message converters or to replace the default list of message converters.
++	 */
++	protected List<HttpMessageConverter<?>> getMessageConverters() {
++		List<HttpMessageConverter<?>> messageConverters = new ArrayList<HttpMessageConverter<?>>();
++		messageConverters.add(new StringHttpMessageConverter());
++		messageConverters.add(getFormMessageConverter());
++		messageConverters.add(getJsonMessageConverter());
++		messageConverters.add(getByteArrayMessageConverter());
++		return messageConverters;
++	}
++
++	/**
++	 * Returns an {@link FormHttpMessageConverter} to be used by the internal {@link RestTemplate}.
++	 * By default, the message converter is set to use "UTF-8" character encoding.
++	 * Override to customize the message converter (for example, to set supported media types or message converters for the parts of a multipart message).
++	 * To remove/replace this or any of the other message converters that are registered by default, override the getMessageConverters() method instead.
++	 */
++	protected FormHttpMessageConverter getFormMessageConverter() {
++		FormHttpMessageConverter converter = new FormHttpMessageConverter();
++		converter.setCharset(Charset.forName("UTF-8"));
++		List<HttpMessageConverter<?>> partConverters = new ArrayList<HttpMessageConverter<?>>();
++		partConverters.add(new ByteArrayHttpMessageConverter());
++		StringHttpMessageConverter stringHttpMessageConverter = new StringHttpMessageConverter(Charset.forName("UTF-8"));
++		stringHttpMessageConverter.setWriteAcceptCharset(false);
++		partConverters.add(stringHttpMessageConverter);
++		partConverters.add(new ResourceHttpMessageConverter());
++		converter.setPartConverters(partConverters);
++		return converter;
++	}
++
++	/**
++	 * Returns a {@link MappingJackson2HttpMessageConverter} to be used by the internal {@link RestTemplate}.
++	 * Override to customize the message converter (for example, to set a custom object mapper or supported media types).
++	 * To remove/replace this or any of the other message converters that are registered by default, override the getMessageConverters() method instead.
++	 */
++	protected MappingJackson2HttpMessageConverter getJsonMessageConverter() {
++		return new MappingJackson2HttpMessageConverter();
++	}
++
++	/**
++	 * Returns a {@link ByteArrayHttpMessageConverter} to be used by the internal {@link RestTemplate} when consuming image or other binary resources.
++	 * By default, the message converter supports "image/jpeg", "image/gif", and "image/png" media types.
++	 * Override to customize the message converter (for example, to set supported media types).
++	 * To remove/replace this or any of the other message converters that are registered by default, override the getMessageConverters() method instead.
++	 */
++	protected ByteArrayHttpMessageConverter getByteArrayMessageConverter() {
++		ByteArrayHttpMessageConverter converter = new ByteArrayHttpMessageConverter();
++		converter.setSupportedMediaTypes(Arrays.asList(MediaType.IMAGE_JPEG, MediaType.IMAGE_GIF, MediaType.IMAGE_PNG));
++		return converter;
++	}
++
++	private RestTemplate createRestTemplate(String accessToken, OAuth2Version version, TokenStrategy tokenStrategy) {
++		RestTemplate client = createRestTemplateWithCulledMessageConverters();
++		ClientHttpRequestInterceptor interceptor = tokenStrategy.interceptor(accessToken, version);
++		List<ClientHttpRequestInterceptor> interceptors = new LinkedList<ClientHttpRequestInterceptor>();
++		interceptors.add(interceptor);
++		client.setInterceptors(interceptors);
++		return client;
++	}
++
++	// Temporary: The RestTemplate that accepts a list of message converters wasn't added until Spring 3.2.7.
++	//            Remove this method and use that constructor exclusively when 3.1.x support is no longer necessary (Spring Social 2.0).
++	private RestTemplate createRestTemplateWithCulledMessageConverters() {
++		RestTemplate client;
++		List<HttpMessageConverter<?>> messageConverters = getMessageConverters();
++		try {
++			client = new RestTemplate(messageConverters);
++		} catch (NoSuchMethodError e) {
++			client = new RestTemplate();
++			client.setMessageConverters(messageConverters);
++		}
++		client.setRequestFactory(GAECompatibleClientHttpRequestFactorySelector.getRequestFactory());
++		return client;
++	}
++
++}
+diff --git a/src/main/java/org/springframework/social/openidconnect/api/impl/GAECompatibleClientHttpRequestFactorySelector.java b/src/main/java/org/springframework/social/openidconnect/api/impl/GAECompatibleClientHttpRequestFactorySelector.java
+new file mode 100644
+index 0000000..19a54ad
+--- /dev/null
++++ b/src/main/java/org/springframework/social/openidconnect/api/impl/GAECompatibleClientHttpRequestFactorySelector.java
+@@ -0,0 +1,96 @@
++/*
++ * Copyright 2014 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.springframework.social.openidconnect.api.impl;
++
++import java.net.InetSocketAddress;
++import java.net.Proxy;
++import java.net.URI;
++import java.util.Properties;
++
++import org.apache.http.HttpHost;
++import org.apache.http.client.HttpClient;
++import org.apache.http.client.protocol.HttpClientContext;
++import org.apache.http.impl.client.HttpClientBuilder;
++import org.apache.http.impl.client.HttpClients;
++import org.apache.http.protocol.HttpContext;
++import org.springframework.http.HttpMethod;
++import org.springframework.http.client.BufferingClientHttpRequestFactory;
++import org.springframework.http.client.ClientHttpRequestFactory;
++import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
++import org.springframework.http.client.SimpleClientHttpRequestFactory;
++import org.springframework.util.ClassUtils;
++
++/**
++ * This is a modified version of
++ * org.springframework.social.support.ClientHttpRequestFactorySelector which
++ * avoids using the HttpComponentsClientHttpRequestFactory's default
++ * constructor, which calls HttpClients.createSystem(), which leads to the use
++ * of java.net.ProxySelector, which is a restricted class on Google App Engine.
++ *
++ * @author Colin Smith
++ */
++public class GAECompatibleClientHttpRequestFactorySelector {
++
++	public static ClientHttpRequestFactory getRequestFactory() {
++		Properties properties = System.getProperties();
++		String proxyHost = properties.getProperty("http.proxyHost");
++		int proxyPort = properties.containsKey("http.proxyPort") ? Integer.valueOf(properties.getProperty("http.proxyPort")) : 80;
++		if (HTTP_COMPONENTS_AVAILABLE) {
++			HttpClientBuilder httpClientBuilder = HttpClients.custom();
++			if (proxyHost != null) {
++				HttpHost proxy = new HttpHost(proxyHost, proxyPort);
++				httpClientBuilder.setProxy(proxy);
++			}
++			return HttpComponentsClientRequestFactoryCreator.createRequestFactory(httpClientBuilder.build(), proxyHost, proxyPort);
++		} else {
++			SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
++			if (proxyHost != null) {
++				requestFactory.setProxy(new Proxy(Proxy.Type.HTTP, new InetSocketAddress(proxyHost, proxyPort)));
++			}
++			return requestFactory;
++		}
++	}
++
++	/**
++	 * Decorates a request factory to buffer responses so that the responses may be repeatedly read.
++	 * @param requestFactory the request factory to be decorated for buffering
++	 * @return a buffering request factory
++	 */
++	public static ClientHttpRequestFactory bufferRequests(ClientHttpRequestFactory requestFactory) {
++		return new BufferingClientHttpRequestFactory(requestFactory);
++	}
++
++	private static final boolean HTTP_COMPONENTS_AVAILABLE = ClassUtils.isPresent("org.apache.http.client.HttpClient", ClientHttpRequestFactory.class.getClassLoader());
++
++	public static class HttpComponentsClientRequestFactoryCreator {
++
++		public static ClientHttpRequestFactory createRequestFactory(HttpClient httpClient, String proxyHost, int proxyPort) {
++
++			HttpComponentsClientHttpRequestFactory requestFactory = new HttpComponentsClientHttpRequestFactory(httpClient) {
++				@Override
++				protected HttpContext createHttpContext(HttpMethod httpMethod, URI uri) {
++					HttpClientContext context = new HttpClientContext();
++					context.setAttribute("http.protocol.expect-continue", false);
++					return context;
++				}
++			};
++
++			return requestFactory;
++
++		}
++	}
++
++}
+diff --git a/src/main/java/org/springframework/social/openidconnect/api/impl/OAuth2RequestInterceptor.java b/src/main/java/org/springframework/social/openidconnect/api/impl/OAuth2RequestInterceptor.java
+new file mode 100644
+index 0000000..cff1205
+--- /dev/null
++++ b/src/main/java/org/springframework/social/openidconnect/api/impl/OAuth2RequestInterceptor.java
+@@ -0,0 +1,50 @@
++/*
++ * Copyright 2014 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.springframework.social.openidconnect.api.impl;
++
++import java.io.IOException;
++
++import org.springframework.http.HttpRequest;
++import org.springframework.http.client.ClientHttpRequestExecution;
++import org.springframework.http.client.ClientHttpRequestInterceptor;
++import org.springframework.http.client.ClientHttpResponse;
++import org.springframework.social.oauth2.OAuth2Version;
++import org.springframework.social.support.HttpRequestDecorator;
++
++/**
++ * ClientHttpRequestInterceptor implementation that adds the OAuth2 access token to protected resource requests before execution.
++ * @author Keith Donald
++ * @author Craig Walls
++ */
++class OAuth2RequestInterceptor implements ClientHttpRequestInterceptor {
++
++	private final String accessToken;
++
++	private final OAuth2Version oauth2Version;
++
++	public OAuth2RequestInterceptor(String accessToken, OAuth2Version oauth2Version) {
++		this.accessToken = accessToken;
++		this.oauth2Version = oauth2Version;
++	}
++
++	@Override
++	public ClientHttpResponse intercept(final HttpRequest request, final byte[] body, ClientHttpRequestExecution execution) throws IOException {
++		HttpRequest protectedResourceRequest = new HttpRequestDecorator(request);
++		protectedResourceRequest.getHeaders().set("Authorization", oauth2Version.getAuthorizationHeaderValue(accessToken));
++		return execution.execute(protectedResourceRequest, body);
++	}
++
++}
+diff --git a/src/main/java/org/springframework/social/openidconnect/api/impl/OAuth2TokenParameterRequestInterceptor.java b/src/main/java/org/springframework/social/openidconnect/api/impl/OAuth2TokenParameterRequestInterceptor.java
+new file mode 100644
+index 0000000..adaaae5
+--- /dev/null
++++ b/src/main/java/org/springframework/social/openidconnect/api/impl/OAuth2TokenParameterRequestInterceptor.java
+@@ -0,0 +1,61 @@
++/*
++ * Copyright 2014 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.springframework.social.openidconnect.api.impl;
++
++import java.io.IOException;
++
++import org.springframework.http.HttpRequest;
++import org.springframework.http.client.ClientHttpRequestExecution;
++import org.springframework.http.client.ClientHttpRequestInterceptor;
++import org.springframework.http.client.ClientHttpResponse;
++import org.springframework.social.support.HttpRequestDecorator;
++
++/**
++ * ClientHttpRequestInterceptor implementation that adds the OAuth2 access token as a query parameter to protected resource requests before execution.
++ * @author Craig Walls
++ */
++class OAuth2TokenParameterRequestInterceptor implements ClientHttpRequestInterceptor {
++
++	private final String parameterName;
++
++	private final String accessToken;
++
++	/**
++	 * Creates an instance of the interceptor, defaulting to use a parameter named "access_token".
++	 * @param accessToken The access token.
++	 */
++	public OAuth2TokenParameterRequestInterceptor(String accessToken) {
++		this(accessToken, "access_token");
++	}
++
++	/**
++	 * Creates an instance of the interceptor, using a parameter with the specified name.
++	 * @param accessToken The access token.
++	 * @param parameterName The name of the query parameter that will carry the access token.
++	 */
++	public OAuth2TokenParameterRequestInterceptor(String accessToken, String parameterName) {
++		this.accessToken = accessToken;
++		this.parameterName = parameterName;
++	}
++
++	@Override
++	public ClientHttpResponse intercept(final HttpRequest request, final byte[] body, ClientHttpRequestExecution execution) throws IOException {
++		HttpRequestDecorator protectedResourceRequest = new HttpRequestDecorator(request);
++		protectedResourceRequest.addParameter(parameterName, accessToken);
++		return execution.execute(protectedResourceRequest, body);
++	}
++
++}
+diff --git a/src/main/java/org/springframework/social/openidconnect/api/impl/TokenStrategy.java b/src/main/java/org/springframework/social/openidconnect/api/impl/TokenStrategy.java
+new file mode 100644
+index 0000000..33fe27a
+--- /dev/null
++++ b/src/main/java/org/springframework/social/openidconnect/api/impl/TokenStrategy.java
+@@ -0,0 +1,54 @@
++/*
++ * Copyright 2014 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.springframework.social.openidconnect.api.impl;
++
++import org.springframework.http.client.ClientHttpRequestInterceptor;
++import org.springframework.social.oauth2.OAuth2Version;
++
++/**
++ * Strategy enumeration where each value carries an interceptor defining how an access token is carried on API requests.
++ * @author Craig Walls
++ */
++public enum TokenStrategy {
++
++	/**
++	 * Indicates that the access token should be carried in the Authorization header as an OAuth2 Bearer token.
++	 */
++	AUTHORIZATION_HEADER {
++		public ClientHttpRequestInterceptor interceptor(String accessToken, OAuth2Version oauth2Version) {
++			return new OAuth2RequestInterceptor(accessToken, oauth2Version);
++		}
++	},
++	/**
++	 * Indicates that the access token should be carried as a query parameter named "access_token".
++	 */
++	ACCESS_TOKEN_PARAMETER {
++		public ClientHttpRequestInterceptor interceptor(String accessToken, OAuth2Version oauth2Version) {
++			return new OAuth2TokenParameterRequestInterceptor(accessToken);
++		}
++	},
++	/**
++	 * Indicates that the access token should be carried as a query parameter named "oauth_token".
++	 */
++	OAUTH_TOKEN_PARAMETER {
++		public ClientHttpRequestInterceptor interceptor(String accessToken, OAuth2Version oauth2Version) {
++			return new OAuth2TokenParameterRequestInterceptor(accessToken, "oauth_token");
++		}
++	};
++
++	abstract ClientHttpRequestInterceptor interceptor(String accessToken, OAuth2Version oauth2Version);
++
++}
+-- 
+1.9.3 (Apple Git-50)
+
