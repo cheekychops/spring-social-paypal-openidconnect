@@ -1,5 +1,7 @@
 package org.springframework.social.openidconnect;
 
+import javax.net.ssl.SSLContext;
+
 import org.apache.http.client.HttpClient;
 import org.apache.http.conn.ClientConnectionManager;
 import org.apache.http.conn.scheme.PlainSocketFactory;
@@ -10,21 +12,7 @@ import org.apache.http.conn.ssl.X509HostnameVerifier;
 import org.apache.http.impl.client.DefaultHttpClient;
 import org.apache.http.impl.conn.PoolingClientConnectionManager;
 import org.apache.log4j.Logger;
-import org.springframework.http.client.ClientHttpRequestFactory;
 import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
-import org.springframework.http.converter.FormHttpMessageConverter;
-import org.springframework.http.converter.HttpMessageConverter;
-import org.springframework.http.converter.json.MappingJacksonHttpMessageConverter;
-import org.springframework.social.ApiException;
-import org.springframework.social.InternalServerErrorException;
-import org.springframework.social.ServerException;
-import org.springframework.social.support.ClientHttpRequestFactorySelector;
-import org.springframework.web.client.DefaultResponseErrorHandler;
-import org.springframework.web.client.RestTemplate;
-
-import javax.net.ssl.SSLContext;
-import java.util.ArrayList;
-import java.util.List;
 
 /**
  * Factory which gives more fine grained control over creation of <code>RestTemplate</code> and allows configuration such as connection time out,
@@ -50,11 +38,10 @@ public final class HttpClientFactory {
      * @return - {@link HttpComponentsClientHttpRequestFactory}
      */
     public static HttpComponentsClientHttpRequestFactory getRequestFactory(boolean isStrict){
-        HttpComponentsClientHttpRequestFactory factory = new HttpComponentsClientHttpRequestFactory();
+        HttpClient httpClient = new DefaultHttpClient(getPooledConnectionManager(isStrict));
+        HttpComponentsClientHttpRequestFactory factory = new HttpComponentsClientHttpRequestFactory(httpClient);
         factory.setConnectTimeout(5000);
         factory.setReadTimeout(5000);
-        HttpClient httpClient = new DefaultHttpClient(getPooledConnectionManager(isStrict));
-        factory.setHttpClient(httpClient);
         if(logger.isDebugEnabled()){
             logger.debug("Factory is set to use connection time out and read time out");
         }
